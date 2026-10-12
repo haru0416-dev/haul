@@ -115,10 +115,10 @@ fn handle(st: &Srv, h: &HeaderMap) -> axum::response::Response {
             if pos >= end {
                 return None;
             }
-            if let Some(d) = drop_at {
-                if sent >= d {
-                    return Some((Err(std::io::Error::other("drop")), (end, sent, r, stall)));
-                }
+            if let Some(d) = drop_at
+                && sent >= d
+            {
+                return Some((Err(std::io::Error::other("drop")), (end, sent, r, stall)));
             }
             if stall && sent > 0 && r.chance(5) {
                 tokio::time::sleep(Duration::from_millis(300)).await;

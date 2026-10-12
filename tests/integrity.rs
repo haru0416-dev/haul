@@ -1,7 +1,6 @@
 //! A download must never be assembled from two different files, even when
 //! re-resolving an expired URL lands somewhere else.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -13,14 +12,10 @@ use pdl::{Options, download};
 use pdl_testserver::{Config, first_mismatch, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-const SIZE: u64 = 4 << 20;
+mod common;
+use common::tmpdir;
 
-fn tmpdir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pdl-integrity-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+const SIZE: u64 = 4 << 20;
 
 /// A 206 response filled with `fill`, optionally labelled with an ETag.
 /// If-Range is deliberately ignored, as some servers do.

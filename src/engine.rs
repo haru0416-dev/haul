@@ -148,17 +148,15 @@ struct Seg {
 struct Plan {
     segs: Vec<Seg>,
     alive: Vec<bool>,
-    /// Per worker: how fast its connection delivers.
+    /// Per worker: its connection's speed and what it is waiting for.
     rates: Vec<Rate>,
-    /// Smoothed time from sending a request to its first byte, in seconds:
-    /// what a worker loses before a newly taken range starts flowing.
-    latency: f64,
+    /// Smoothed time from a request on a live connection to its first byte,
+    /// once measured (see `latency`).
+    measured_latency: Option<f64>,
     /// The same for a worker without a usable connection, which first has
     /// to connect (TCP and TLS handshakes): from the probe at first, then
     /// from the requests that opened connections.
     connect_latency: f64,
-    /// `latency` has been measured, not just derived from the probe.
-    latency_measured: bool,
 }
 
 /// A connection's delivery speed, an exponential moving average over the
@@ -170,17 +168,28 @@ struct Rate {
     /// Start of the current sample, while a response is streaming.
     since: Option<Instant>,
     bytes: u64,
-    /// The connection has carried a response before, so its next request
-    /// pays one round trip, not a handshake.
-    reused: bool,
-    /// When the current connection delivered its first response; while it
-    /// is young, TCP slow start keeps it below its eventual speed.
+    /// When the current connection delivered its first response (None: no
+    /// connection to reuse). While it is young, TCP slow start keeps it
+    /// below its eventual speed.
     born: Option<Instant>,
     /// When the connection last delivered bytes.
     last: Option<Instant>,
     /// A request awaiting its response: when it was sent, and how long the
     /// response was expected to take.
     pending: Option<(Instant, f64)>,
+}
+
+/// The range a split would take from, and what its worker still needs.
+struct Victim {
+    seg: usize,
+    owner: usize,
+    remain: u64,
+    /// Bytes per second once flowing.
+    v: f64,
+    /// Seconds before its bytes flow (see `Rate::wait`).
+    wait: f64,
+    /// Predicted seconds until it is done: `wait + remain / v`.
+    finish: f64,
 }
 
 /// The worker a split would hand work to, and how long it needs for it.
@@ -239,6 +248,14 @@ impl Thief {
     }
 }
 
+/// Why a worker stops a range before its end (see `Shared::wake`).
+enum Stop {
+    /// `steer` cut the number of connections.
+    Retired,
+    /// Others took everything that was left in it.
+    TakenOver,
+}
+
 /// What a worker should do next.
 enum Claim {
     Work(usize),
@@ -258,6 +275,8 @@ const STEAL_FLOOR: u64 = 64 << 10;
 /// A split that brings its victim's predicted end forward by at least this
 /// much is made whatever its size: the victim has all but stalled.
 const RESCUE_SAVING: f64 = 0.25;
+/// Least silence before a connection counts as stalled (see `Plan::grace`).
+const MIN_GRACE: f64 = 0.3;
 /// A new TCP connection's first flight (Linux's initial window of ten
 /// segments); slow start doubles it every round trip.
 const INITIAL_WINDOW: f64 = 14600.0;
@@ -291,9 +310,34 @@ impl Rate {
         }
     }
 
+    /// Predicted wait before this worker's bytes flow again: what is left of
+    /// a request in flight, or for a silent connection the time it has been
+    /// silent beyond `grace`. A delay that has lasted is taken to last as
+    /// long again. (Speeds only update on arrival, so without this a stalled
+    /// connection would keep its old average and never look late.)
+    fn wait(&self, now: Instant, grace: f64) -> f64 {
+        match self.pending {
+            Some((sent, expect)) => (expect - now.duration_since(sent).as_secs_f64()).abs(),
+            None => self.last.map_or(0.0, |t| {
+                (now.duration_since(t).as_secs_f64() - grace).max(0.0)
+            }),
+        }
+    }
+
     /// The worker holds a connection its next request can reuse.
     fn live(&self, now: Instant) -> bool {
-        self.reused && self.last.is_none_or(|t| now.duration_since(t) < KEEPALIVE)
+        self.born.is_some() && self.last.is_none_or(|t| now.duration_since(t) < KEEPALIVE)
+    }
+
+    /// The connection is gone: the next one is of unknown speed. When the
+    /// worker last received and what it waits for still hold; they tell
+    /// others whether it has stalled.
+    fn forget(&mut self) {
+        *self = Rate {
+            last: self.last,
+            pending: self.pending,
+            ..Rate::default()
+        };
     }
 
     fn add(&mut self, n: u64, now: Instant) {
@@ -318,6 +362,41 @@ impl Rate {
 impl Plan {
     fn workers(&self) -> usize {
         self.alive.iter().filter(|&&a| a).count()
+    }
+
+    /// Time from a request on a live connection to its first byte; until
+    /// measured, a third of the connecting time (handshakes and request are
+    /// roughly three round trips).
+    fn latency(&self) -> f64 {
+        self.measured_latency.unwrap_or(self.connect_latency / 3.0)
+    }
+
+    fn rtt(&self) -> f64 {
+        self.latency().max(0.001)
+    }
+
+    /// Silence tolerated before a connection counts as stalled.
+    fn grace(&self) -> f64 {
+        (2.0 * self.rtt()).max(MIN_GRACE)
+    }
+
+    /// Worker `id` is about to send a request: until its response starts it
+    /// counts as waiting for one, not as a silent (stalled) connection.
+    fn mark_pending(&mut self, id: usize, now: Instant) {
+        let expect = if self.rates[id].live(now) {
+            self.latency()
+        } else {
+            self.connect_latency
+        };
+        self.rates[id].pending = Some((now, expect));
+    }
+
+    /// Workers streaming a range.
+    fn streaming(&self) -> impl Iterator<Item = usize> + '_ {
+        self.segs
+            .iter()
+            .filter(|s| s.written < s.end)
+            .filter_map(|s| s.owner)
     }
 }
 
@@ -368,39 +447,26 @@ impl Shared {
     /// nothing is left at all, the worker is marked as gone.
     fn claim(&self, id: usize) -> Claim {
         let mut plan = self.plan.lock().unwrap();
-        // Workers streaming now; `target` caps them (see `steer`). A stalled
-        // one holds no slot: it must not keep others from taking its range.
         let now = Instant::now();
-        let grace = (2.0 * plan.latency.max(0.001)).max(0.3);
+        // `target` caps the workers streaming (see `steer`). A stalled one
+        // holds no slot: it must not keep others from taking its range.
+        let grace = plan.grace();
         let busy = plan
-            .segs
-            .iter()
-            .filter(|s| s.written < s.end)
-            .filter_map(|s| s.owner)
+            .streaming()
             .filter(|&w| !plan.rates[w].stalled(now, grace))
             .count();
-        if busy < self.target.load(Ordering::Relaxed) {
-            if let Some(seg) = Self::claim_locked(&mut plan, id, self.min_split) {
-                // A stop meant for its previous range must not end this one.
-                self.retire[id].store(false, Ordering::Relaxed);
-                // Its request goes out next; until it does, the worker must
-                // not look like a stalled victim to others.
-                let now = Instant::now();
-                let expect = if plan.rates[id].live(now) {
-                    plan.latency
-                } else {
-                    plan.connect_latency
-                };
-                plan.rates[id].pending = Some((now, expect));
-                // Victims left with nothing to fetch may be stuck waiting on
-                // a stalled connection: let them go.
-                for s in &plan.segs {
-                    if let Some(w) = s.owner.filter(|&w| w != id && s.fetched >= s.end) {
-                        self.wake[w].notify_one();
-                    }
-                }
-                return Claim::Work(seg);
+        if busy < self.target.load(Ordering::Relaxed)
+            && let Some((seg, emptied)) = Self::claim_locked(&mut plan, id, self.min_split, now)
+        {
+            // A stop meant for its previous range must not end this one.
+            self.retire[id].store(false, Ordering::Relaxed);
+            plan.mark_pending(id, now);
+            // A victim left with nothing to fetch may be stuck waiting on
+            // a stalled connection: let it go.
+            if let Some(w) = emptied {
+                self.wake[w].notify_one();
             }
+            return Claim::Work(seg);
         }
         if plan.segs.iter().any(|s| s.written < s.end) {
             return Claim::Wait;
@@ -423,22 +489,23 @@ impl Shared {
     /// must connect first also pays the handshakes and slow start (see
     /// `Thief::time`), which makes it take less. Before any speed is known,
     /// ranges are halved.
-    fn claim_locked(plan: &mut Plan, id: usize, min_split: u64) -> Option<usize> {
+    /// Returns the new segment, and the victim's worker when it was left
+    /// with nothing.
+    fn claim_locked(
+        plan: &mut Plan,
+        id: usize,
+        min_split: u64,
+        now: Instant,
+    ) -> Option<(usize, Option<usize>)> {
         if let Some(i) = plan
             .segs
             .iter()
             .position(|s| s.owner.is_none() && s.written < s.end)
         {
             plan.segs[i].owner = Some(id);
-            return Some(i);
+            return Some((i, None));
         }
-        let known: Vec<f64> = plan
-            .rates
-            .iter()
-            .map(|r| r.bps)
-            .filter(|&b| b > 0.0)
-            .collect();
-        let (i, x) = if known.is_empty() {
+        let (i, x, emptied) = if !plan.rates.iter().any(|r| r.bps > 0.0) {
             let (i, remain) = plan
                 .segs
                 .iter()
@@ -449,90 +516,85 @@ impl Shared {
             if remain < 2 * min_split {
                 return None;
             }
-            (i, remain - remain / 2)
+            (i, remain - remain / 2, None)
         } else {
-            let rtt = plan.latency.max(0.001);
-            let now = Instant::now();
+            let rtt = plan.rtt();
+            let grace = plan.grace();
             let warm = |w: usize| {
                 plan.rates[w]
                     .born
                     .is_some_and(|b| now.duration_since(b).as_secs_f64() >= WARM_RTTS * rtt)
             };
-            let steady: Vec<f64> = (0..plan.rates.len())
-                .filter(|&w| warm(w) && plan.rates[w].bps > 0.0)
-                .map(|w| plan.rates[w].bps)
-                .collect();
-            let pool = if steady.is_empty() { &known } else { &steady };
-            let mean = pool.iter().sum::<f64>() / pool.len() as f64;
+            // Mean speed of established connections, or of every measured
+            // one while none is established yet.
+            let (mut all, mut steady) = ((0.0, 0u32), (0.0, 0u32));
+            for (w, r) in plan.rates.iter().enumerate().filter(|(_, r)| r.bps > 0.0) {
+                all = (all.0 + r.bps, all.1 + 1);
+                if warm(w) {
+                    steady = (steady.0 + r.bps, steady.1 + 1);
+                }
+            }
+            let pool = if steady.1 > 0 { steady } else { all };
+            let mean = pool.0 / f64::from(pool.1);
             // A young connection is still ramping up: judge it by what an
             // established one does, not by its first slow round trips.
             let speed = |w: usize| match plan.rates[w].bps {
                 b if b > 0.0 && warm(w) => b,
                 b => b.max(mean),
             };
-            // What a victim still needs: a wait before its bytes flow, then
-            // its speed. The wait is what is left of a request in flight, or
-            // for a silent connection the time it has been silent beyond a
-            // grace period: a delay that has lasted is taken to last as long
-            // again. (Speeds only update on arrival, so a stalled connection
-            // would otherwise keep its old average and never look late.)
-            let grace = (2.0 * rtt).max(0.3);
-            let outlook = |w: usize| {
-                let rate = &plan.rates[w];
-                let v = speed(w);
-                match rate.pending {
-                    Some((sent, expect)) => {
-                        let waited = now.duration_since(sent).as_secs_f64();
-                        ((expect - waited).abs(), v)
-                    }
-                    None => {
-                        let quiet = rate
-                            .last
-                            .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
-                        ((quiet - grace).max(0.0), v)
-                    }
-                }
-            };
-            let (i, remain, v, wait) = plan
+            let victim = plan
                 .segs
                 .iter()
                 .enumerate()
                 .filter_map(|(i, s)| {
-                    let (wait, v) = outlook(s.owner?);
-                    Some((i, s.end - s.fetched, v, wait))
+                    let owner = s.owner?;
+                    let remain = s.end - s.fetched;
+                    let v = speed(owner);
+                    let wait = plan.rates[owner].wait(now, grace);
+                    let finish = wait + remain as f64 / v;
+                    (remain > 0).then_some(Victim {
+                        seg: i,
+                        owner,
+                        remain,
+                        v,
+                        wait,
+                        finish,
+                    })
                 })
-                .filter(|&(_, r, _, _)| r > 0)
-                .max_by(|a, b| (a.3 + a.1 as f64 / a.2).total_cmp(&(b.3 + b.1 as f64 / b.2)))?;
-            let r = remain as f64;
+                .max_by(|a, b| a.finish.total_cmp(&b.finish))?;
             let thief = Thief {
                 connected: plan.rates[id].live(now),
                 speed: speed(id),
-                latency: plan.latency,
+                latency: plan.latency(),
                 connect: plan.connect_latency,
                 rtt,
             };
-            let x = thief.balance(r, v, wait);
+            let x = thief.balance(victim.remain as f64, victim.v, victim.wait);
             if x < 1.0 {
                 return None;
             }
             // A sliver left with the victim is not worth its own request,
             // and if the victim has stalled it would hold the download.
             let floor = min_split.min(STEAL_FLOOR);
-            let x = (x.ceil() as u64).clamp(1, remain);
-            let x = if remain - x < floor { remain } else { x };
+            let x = (x.ceil() as u64).clamp(1, victim.remain);
+            let x = if victim.remain - x < floor {
+                victim.remain
+            } else {
+                x
+            };
             // How much sooner the last of the two ends (a victim left with
             // nothing is done at once).
-            let before = wait + r / v;
-            let victim_after = if x == remain {
+            let emptied = x == victim.remain;
+            let victim_after = if emptied {
                 0.0
             } else {
-                wait + (remain - x) as f64 / v
+                victim.wait + (victim.remain - x) as f64 / victim.v
             };
-            let saving = before - victim_after.max(thief.time(x as f64));
+            let saving = victim.finish - victim_after.max(thief.time(x as f64));
             if saving <= 0.0 || (x < floor && saving < RESCUE_SAVING) {
                 return None;
             }
-            (i, x)
+            (victim.seg, x, emptied.then_some(victim.owner))
         };
         let victim = &mut plan.segs[i];
         let cut = victim.end - x;
@@ -544,21 +606,12 @@ impl Shared {
             end,
             owner: Some(id),
         });
-        Some(plan.segs.len() - 1)
+        Some((plan.segs.len() - 1, emptied))
     }
 
-    /// The worker's connection is gone; its next one is of unknown speed.
-    /// When it last received and what it waits for still hold: they tell
-    /// others whether it has stalled.
+    /// Worker `id`'s connection is gone (see `Rate::forget`).
     fn forget_rate(&self, id: usize) {
-        let mut plan = self.plan.lock().unwrap();
-        let old = &plan.rates[id];
-        let (last, pending) = (old.last, old.pending);
-        plan.rates[id] = Rate {
-            last,
-            pending,
-            ..Rate::default()
-        };
+        self.plan.lock().unwrap().rates[id].forget();
     }
 
     /// Records a request's time to first byte. Only requests on reused
@@ -567,24 +620,15 @@ impl Shared {
     fn observe_latency(&self, id: usize, secs: f64) {
         let mut plan = self.plan.lock().unwrap();
         let now = Instant::now();
-        let rate = &mut plan.rates[id];
-        let was_live = rate.live(now);
-        rate.reused = true;
-        if was_live {
-            plan.latency = if plan.latency_measured {
-                0.7 * plan.latency + 0.3 * secs
-            } else {
-                secs
-            };
-            plan.latency_measured = true;
+        plan.rates[id].pending = None;
+        if plan.rates[id].live(now) {
+            plan.measured_latency =
+                Some(plan.measured_latency.map_or(secs, |l| 0.7 * l + 0.3 * secs));
         } else {
             // This request opened a connection: what that costs here, free
             // of the probe's DNS lookup, redirects and retries.
-            rate.born = Some(now);
+            plan.rates[id].born = Some(now);
             plan.connect_latency = 0.5 * plan.connect_latency + 0.5 * secs;
-            if !plan.latency_measured {
-                plan.latency = plan.connect_latency / 3.0;
-            }
         }
     }
 
@@ -592,13 +636,8 @@ impl Shared {
     /// (a connection still slow-starting counts as slowest).
     fn retire_extra(&self, keep: usize) {
         let plan = self.plan.lock().unwrap();
-        let mut busy: Vec<(usize, f64)> = plan
-            .segs
-            .iter()
-            .filter(|s| s.written < s.end)
-            .filter_map(|s| s.owner)
-            .map(|w| (w, plan.rates[w].bps))
-            .collect();
+        let mut busy: Vec<(usize, f64)> =
+            plan.streaming().map(|w| (w, plan.rates[w].bps)).collect();
         busy.sort_by(|a, b| a.1.total_cmp(&b.1));
         let extra = busy.len().saturating_sub(keep);
         for &(w, _) in &busy[..extra] {
@@ -607,10 +646,15 @@ impl Shared {
         }
     }
 
-    /// Whether worker `id` should stop working on `seg`: told to retire, or
-    /// nothing left in it (taken over by others).
-    fn stopped(&self, id: usize, seg: usize) -> bool {
-        self.retire[id].swap(false, Ordering::Relaxed) || self.seg(seg, |s| s.fetched >= s.end)
+    /// Why worker `id` should stop working on `seg`, if it should.
+    fn stop_reason(&self, id: usize, seg: usize) -> Option<Stop> {
+        if self.retire[id].swap(false, Ordering::Relaxed) {
+            Some(Stop::Retired)
+        } else if self.seg(seg, |s| s.fetched >= s.end) {
+            Some(Stop::TakenOver)
+        } else {
+            None
+        }
     }
 
     /// Hands `seg` back unowned; its worker stays alive.
@@ -620,11 +664,7 @@ impl Shared {
 
     /// Workers streaming a range (waiting ones are not counted).
     fn active(&self) -> usize {
-        let plan = self.plan.lock().unwrap();
-        plan.segs
-            .iter()
-            .filter(|s| s.owner.is_some() && s.written < s.end)
-            .count()
+        self.plan.lock().unwrap().streaming().count()
     }
 
     fn release_locked(plan: &mut Plan, seg: usize) {
@@ -1084,7 +1124,13 @@ pub async fn download(
     let client = build_client(&opts, &plain_headers)?;
 
     let part_existed = part.exists();
-    let file = lock_part(&part)?;
+    // Held until this returns. Writes go through their own handle, so the
+    // lock does not wait for whatever task still holds that one.
+    let _lock = lock_part(&part)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .with_context(|| format!("cannot write {}", part.display()))?;
     // A checkpoint is only trusted when the server still has the same file.
     let saved = match load_state(&state_file).filter(|s| part_existed && s.url == opts.url) {
         Some(s) if !consistent(&s, &file) => {
@@ -1294,17 +1340,13 @@ pub async fn download(
                 if first_resp.is_some() {
                     // Worker 0 streams the probe's response: connected now.
                     let now = Instant::now();
-                    rates[0].reused = true;
                     rates[0].born = Some(now);
                     rates[0].last = Some(now);
                 }
                 rates
             },
-            // The probe also paid for DNS and the TCP and TLS handshakes,
-            // roughly three round trips in all.
-            latency: probe_latency / 3.0,
+            measured_latency: None,
             connect_latency: probe_latency,
-            latency_measured: false,
         }),
         cancel: cancel.clone(),
         events: events.clone(),
@@ -1384,9 +1426,8 @@ pub async fn download(
     }
     stop_checkpoints.cancel();
     let _ = checkpointer.await;
-    // Both hold the shared state, and so the partial file and its lock: they
-    // must be gone before this returns, or a download started right after
-    // (a quick pause and resume) would find the file still locked.
+    // Nothing of this download may outlive it (the lock alone is released
+    // regardless, see `_lock`).
     ticker.stop().await;
     steering.stop().await;
 
@@ -1457,15 +1498,16 @@ const STEER_GAIN: f64 = 1.25;
 /// go back and stop. Stop as well when what is left would be done before
 /// new connections could get up to speed.
 async fn steer(shared: Arc<Shared>, max: usize) {
-    let (mut n, mut prev) = (1usize, 1usize);
-    let mut base: Option<f64> = None;
+    let mut n = 1usize;
+    // The step before: its number of connections and its throughput.
+    let mut base: Option<(usize, f64)> = None;
     let mut changed = Instant::now();
     let mut last = (Instant::now(), shared.received());
     let mut last_rate = 0.0;
     loop {
         let (rtt, connect) = {
             let p = shared.plan.lock().unwrap();
-            (p.latency.max(0.001), p.connect_latency)
+            (p.rtt(), p.connect_latency)
         };
         // Long enough for a round trip, and for enough bytes that one chunk
         // more or less cannot fake the gain a step is judged by (at 512 KiB/s
@@ -1489,7 +1531,7 @@ async fn steer(shared: Arc<Shared>, max: usize) {
             continue;
         }
         // Every step is judged, the last one too.
-        if base.is_some_and(|b| rate < STEER_GAIN * b) {
+        if let Some((prev, _)) = base.filter(|&(_, b)| rate < STEER_GAIN * b) {
             shared.target.store(prev, Ordering::Relaxed);
             // Lowering the cap alone would leave the extra connections
             // streaming their ranges to the end.
@@ -1503,8 +1545,7 @@ async fn steer(shared: Arc<Shared>, max: usize) {
         if left < rate * (connect + WARM_RTTS * rtt) {
             return;
         }
-        base = Some(rate);
-        prev = n;
+        base = Some((n, rate));
         n = (n * STEER_STEP).min(max);
         shared.target.store(n, Ordering::Relaxed);
         changed = now;
@@ -1723,7 +1764,7 @@ async fn worker_loop(
     shared: &Arc<Shared>,
     initial: &mut Option<(usize, Response)>,
 ) -> anyhow::Result<()> {
-    'claim: loop {
+    loop {
         if shared.cancel.is_cancelled() {
             return Ok(());
         }
@@ -1756,7 +1797,7 @@ async fn worker_loop(
                 }
                 Err(SegError::Retired) => {
                     shared.release(seg);
-                    continue 'claim;
+                    break;
                 }
                 Err(SegError::Fatal(e)) => {
                     shared.leave(id, seg);
@@ -1821,8 +1862,11 @@ async fn fetch_segment(
     }
     // Leading bytes of a whole-file response that are already on disk.
     let mut skip = 0u64;
+    // Where the response's body ends: reading up to it leaves the
+    // connection reusable.
+    let mut resp_end = to;
 
-    let mut resp = match resp {
+    let resp = match resp {
         Some(r) => r,
         None => {
             let url = shared.url.read().unwrap().clone();
@@ -1854,6 +1898,7 @@ async fn fetch_segment(
                         });
                         from = first;
                         skip = first;
+                        resp_end = shared.size;
                         resp
                     }
                     None => return Err(SegError::Rejected("server ignored Range".into())),
@@ -1864,6 +1909,12 @@ async fn fetch_segment(
     };
 
     shared.plan.lock().unwrap().rates[id].start(Instant::now());
+    let mut stream = Stream {
+        resp,
+        shared,
+        id,
+        finished: false,
+    };
     let mut buf = Pending::default();
     let mut write_pos = from;
     let mut last_flush = Instant::now();
@@ -1874,20 +1925,18 @@ async fn fetch_segment(
     loop {
         let deadline = tokio::time::Instant::from_std(window.0 + shared.low_speed_window);
         let chunk = tokio::select! {
-            c = resp.chunk() => c,
+            c = stream.resp.chunk() => c,
             _ = shared.cancel.cancelled() => {
                 flush(shared, seg, &mut buf, &mut write_pos).await.map_err(SegError::Fatal)?;
                 return Err(SegError::Cancelled);
             }
             _ = shared.wake[id].notified() => {
-                let retire = shared.retire[id].swap(false, Ordering::Relaxed);
-                if retire || shared.seg(seg, |s| s.fetched >= s.end) {
-                    flush(shared, seg, &mut buf, &mut write_pos).await.map_err(SegError::Fatal)?;
-                    // The response is dropped unfinished: its connection closes.
-                    shared.forget_rate(id);
-                    return if retire { Err(SegError::Retired) } else { Ok(()) };
-                }
-                continue;
+                let Some(why) = shared.stop_reason(id, seg) else { continue };
+                flush(shared, seg, &mut buf, &mut write_pos).await.map_err(SegError::Fatal)?;
+                return match why {
+                    Stop::Retired => Err(SegError::Retired),
+                    Stop::TakenOver => Ok(()),
+                };
             }
             _ = tokio::time::sleep_until(deadline), if watch_speed => {
                 let speed = window.1 as f64 / window.0.elapsed().as_secs_f64();
@@ -1895,7 +1944,6 @@ async fn fetch_segment(
                 let limited = window.2 || throttled();
                 if !limited && speed < shared.lowest_speed_limit as f64 {
                     flush(shared, seg, &mut buf, &mut write_pos).await.map_err(SegError::Fatal)?;
-                    shared.forget_rate(id);
                     return Err(SegError::Retry(anyhow!(
                         "connection too slow ({} B/s); reconnecting",
                         speed as u64
@@ -1912,16 +1960,15 @@ async fn fetch_segment(
                     .await
                     .map_err(SegError::Fatal)?;
                 if shared.seg(seg, |s| s.written < s.end) {
-                    shared.forget_rate(id);
                     return Err(SegError::Retry(anyhow!("connection closed early")));
                 }
+                stream.finished = true;
                 return Ok(());
             }
             Err(e) => {
                 flush(shared, seg, &mut buf, &mut write_pos)
                     .await
                     .map_err(SegError::Fatal)?;
-                shared.forget_rate(id);
                 return Err(SegError::Retry(e.into()));
             }
         };
@@ -1933,14 +1980,6 @@ async fn fetch_segment(
             if chunk.is_empty() {
                 continue;
             }
-        }
-        if shared.retire[id].swap(false, Ordering::Relaxed) {
-            flush(shared, seg, &mut buf, &mut write_pos)
-                .await
-                .map_err(SegError::Fatal)?;
-            // Dropping the response closes the connection.
-            shared.forget_rate(id);
-            return Err(SegError::Retired);
         }
         let (take, done) = {
             let mut plan = shared.plan.lock().unwrap();
@@ -1971,13 +2010,27 @@ async fn fetch_segment(
             last_flush = Instant::now();
         }
         if done {
-            // Dropping `resp` here closes a connection whose range was cut
-            // short; the next request goes out on a new one, whose speed is
-            // not this one's.
-            if shared.seg(seg, |s| s.end) < to {
-                shared.forget_rate(id);
-            }
+            // A range cut short leaves the rest of the body unread.
+            stream.finished = shared.seg(seg, |s| s.end) >= resp_end;
             return Ok(());
+        }
+    }
+}
+
+/// A response worker `id` is reading. Dropped before its body was read to
+/// the end, it takes its connection with it (the stream cannot be resumed),
+/// so the worker's next request opens a new connection of unknown speed.
+struct Stream<'a> {
+    resp: Response,
+    shared: &'a Shared,
+    id: usize,
+    finished: bool,
+}
+
+impl Drop for Stream<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.shared.forget_rate(self.id);
         }
     }
 }
@@ -1999,22 +2052,17 @@ async fn request_range(
     from: u64,
     to: u64,
 ) -> Result<Response, SegError> {
-    {
-        let mut plan = shared.plan.lock().unwrap();
-        let now = Instant::now();
-        let expect = if plan.rates[id].live(now) {
-            plan.latency
-        } else {
-            plan.connect_latency
-        };
-        plan.rates[id].pending = Some((now, expect));
-    }
+    shared.plan.lock().unwrap().mark_pending(id, Instant::now());
     let r = send_range(id, seg, client, shared, url, from, to).await;
-    shared.plan.lock().unwrap().rates[id].pending = None;
     // A refused or unusable response is dropped unread, which closes its
-    // connection; so does a failed send.
-    if matches!(&r, Err(e) if !matches!(e, SegError::Cancelled)) {
-        shared.forget_rate(id);
+    // connection; so does a failed send. (A response that arrived cleared
+    // `pending` in `observe_latency`.)
+    if let Err(e) = &r {
+        let mut plan = shared.plan.lock().unwrap();
+        plan.rates[id].pending = None;
+        if !matches!(e, SegError::Cancelled) {
+            plan.rates[id].forget();
+        }
     }
     r
 }
@@ -2041,7 +2089,7 @@ async fn send_range(
     // A stop may have come between the claim and here, its wake-up drained
     // with the stale ones: check before waiting on a server that may never
     // answer.
-    if shared.stopped(id, seg) {
+    if shared.stop_reason(id, seg).is_some() {
         return Err(SegError::Retired);
     }
     let send = req.send();
@@ -2052,7 +2100,7 @@ async fn send_range(
             _ = shared.cancel.cancelled() => return Err(SegError::Cancelled),
             // Taken over or retired while waiting for the response.
             _ = shared.wake[id].notified() => {
-                if shared.stopped(id, seg) {
+                if shared.stop_reason(id, seg).is_some() {
                     return Err(SegError::Retired);
                 }
             }
@@ -2098,12 +2146,12 @@ async fn send_range(
     }
     // Servers that ignore If-Range still label what they send; a different
     // label means a different file, or a mirror that labels it differently.
-    if let (Some(want), Some(got)) = (&shared.validator, validator(resp.headers())) {
-        if *want != got {
-            return Err(SegError::Rejected(format!(
-                "remote file changed (validator {want} became {got})"
-            )));
-        }
+    if let (Some(want), Some(got)) = (&shared.validator, validator(resp.headers()))
+        && *want != got
+    {
+        return Err(SegError::Rejected(format!(
+            "remote file changed (validator {want} became {got})"
+        )));
     }
     Ok(resp)
 }

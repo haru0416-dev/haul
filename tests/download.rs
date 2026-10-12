@@ -1,34 +1,13 @@
-use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use pdl::engine::{part_path, state_path};
-use pdl::{Event, Options, download};
-use pdl_testserver::{Config, first_mismatch, spawn_local};
+use pdl::{Event, download};
+use pdl_testserver::{Config, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-fn tmpdir(name: &str) -> PathBuf {
-    // On disk under target/, not a RAM-backed /tmp.
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pdl-test-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn opts(url: String, out: &Path) -> Options {
-    let mut o = Options::new(url, out);
-    o.min_split = 256 << 10;
-    o.checkpoint_interval = Duration::from_millis(100);
-    o
-}
-
-fn assert_file(path: &Path, size: u64) {
-    let data = std::fs::read(path).unwrap();
-    assert_eq!(data.len() as u64, size);
-    assert_eq!(first_mismatch(&data), None);
-    assert!(!part_path(path).exists());
-    assert!(!state_path(path).exists());
-}
+mod common;
+use common::{assert_file, opts, tmpdir};
 
 #[tokio::test]
 async fn segmented_download_is_exact() {

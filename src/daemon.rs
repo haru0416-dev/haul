@@ -746,26 +746,26 @@ fn origin_allowed(d: &Daemon, origin: &str) -> bool {
 /// cross-site POSTs and WebSockets are not stopped by CORS), and when bound
 /// to loopback, a Host that is not loopback (DNS rebinding).
 fn check_caller(d: &Daemon, headers: &HeaderMap) -> Result<(), Response> {
-    if d.loopback {
-        if let Some(host) = headers.get(header::HOST) {
-            let host = host.to_str().unwrap_or("");
-            let name = match host.strip_prefix('[') {
-                Some(v6) => v6.split(']').next().unwrap_or(""),
-                None => host.split(':').next().unwrap_or(""),
-            };
-            let ok = name.eq_ignore_ascii_case("localhost")
-                || name
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback());
-            if !ok {
-                return Err((StatusCode::FORBIDDEN, "Host not allowed").into_response());
-            }
+    if d.loopback
+        && let Some(host) = headers.get(header::HOST)
+    {
+        let host = host.to_str().unwrap_or("");
+        let name = match host.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => host.split(':').next().unwrap_or(""),
+        };
+        let ok = name.eq_ignore_ascii_case("localhost")
+            || name
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !ok {
+            return Err((StatusCode::FORBIDDEN, "Host not allowed").into_response());
         }
     }
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        if !origin_allowed(d, origin.to_str().unwrap_or("")) {
-            return Err((StatusCode::FORBIDDEN, "Origin not allowed").into_response());
-        }
+    if let Some(origin) = headers.get(header::ORIGIN)
+        && !origin_allowed(d, origin.to_str().unwrap_or(""))
+    {
+        return Err((StatusCode::FORBIDDEN, "Origin not allowed").into_response());
     }
     Ok(())
 }
@@ -969,10 +969,10 @@ fn call_method(d: &Daemon, method: &str, mut params: Vec<Value>) -> RpcResult {
         }
         _ => None,
     };
-    if let Some(secret) = &d.secret {
-        if token.as_deref() != Some(secret.as_str()) {
-            return Err(fail("Unauthorized"));
-        }
+    if let Some(secret) = &d.secret
+        && token.as_deref() != Some(secret.as_str())
+    {
+        return Err(fail("Unauthorized"));
     }
     let p = Params(params);
     match method {

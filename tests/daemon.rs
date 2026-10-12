@@ -5,15 +5,11 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use pdl::daemon::{self, Handle};
 use pdl::engine::{part_path, state_path};
-use pdl_testserver::{Config, first_mismatch, spawn_local};
+use pdl_testserver::{Config, spawn_local};
 use serde_json::{Value, json};
 
-fn tmpdir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pdl-daemon-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+mod common;
+use common::{assert_file, tmpdir};
 
 async fn start(dir: &Path, f: impl FnOnce(&mut daemon::Config)) -> Handle {
     let mut cfg = daemon::Config {
@@ -69,14 +65,6 @@ async fn wait_progress(d: &Handle, gid: &str) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("no progress");
-}
-
-fn assert_file(path: &Path, size: u64) {
-    let data = std::fs::read(path).unwrap();
-    assert_eq!(data.len() as u64, size);
-    assert_eq!(first_mismatch(&data), None);
-    assert!(!part_path(path).exists());
-    assert!(!state_path(path).exists());
 }
 
 #[tokio::test]
@@ -486,10 +474,10 @@ fn hook_script(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
 async fn wait_for_file(path: &Path) -> String {
     // Failed first requests are retried for about 6 s before erroring out.
     for _ in 0..300 {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if !s.is_empty() {
-                return s;
-            }
+        if let Ok(s) = std::fs::read_to_string(path)
+            && !s.is_empty()
+        {
+            return s;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

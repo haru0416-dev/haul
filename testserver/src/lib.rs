@@ -114,6 +114,8 @@ pub struct Stats {
     pub served: AtomicU64,
     pub redirects: AtomicU64,
     pub expired: AtomicU64,
+    /// Requests that carried an Authorization or Cookie header.
+    pub credentialed: AtomicU64,
 }
 
 struct State {
@@ -247,6 +249,9 @@ fn handle(
     let cfg = &state.config;
     let stats = &state.stats;
     let n = stats.requests.fetch_add(1, Ordering::SeqCst) + 1;
+    if headers.contains_key(header::AUTHORIZATION) || headers.contains_key(header::COOKIE) {
+        stats.credentialed.fetch_add(1, Ordering::SeqCst);
+    }
     if cfg.fail_requests.contains(&n) {
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -299,10 +304,9 @@ fn handle(
     if let Some(if_range) = headers
         .get(header::IF_RANGE)
         .filter(|_| !cfg.ignore_if_range)
+        && if_range.as_bytes() != etag.as_bytes()
     {
-        if if_range.as_bytes() != etag.as_bytes() {
-            range = None;
-        }
+        range = None;
     }
 
     let (status, start, end) = match range {

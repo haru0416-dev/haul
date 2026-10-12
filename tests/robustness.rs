@@ -1,96 +1,18 @@
 //! Misbehaving servers, credentials across redirects, and concurrent use of
 //! one output path.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{StatusCode, header};
 use pdl::engine::{part_path, state_path};
 use pdl::{Event, Options, download};
-use pdl_testserver::{Config, fill, first_mismatch, spawn_local};
+use pdl_testserver::{Config, fill, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-fn tmpdir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pdl-robust-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn opts(url: String, out: &Path) -> Options {
-    let mut o = Options::new(url, out);
-    o.min_split = 256 << 10;
-    o.checkpoint_interval = Duration::from_millis(100);
-    o
-}
-
-fn assert_file(path: &Path, size: u64) {
-    let data = std::fs::read(path).unwrap();
-    assert_eq!(data.len() as u64, size);
-    assert_eq!(first_mismatch(&data), None);
-    assert!(!part_path(path).exists());
-    assert!(!state_path(path).exists());
-}
-
-/// Serves the test file with ranges and counts requests carrying credentials.
-async fn counting_origin(size: u64) -> (String, Arc<[AtomicU64; 2]>) {
-    // [requests, requests with Authorization or Cookie]
-    let seen: Arc<[AtomicU64; 2]> = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
-    let s = seen.clone();
-    let app = axum::Router::new().fallback(move |h: HeaderMap| {
-        let seen = s.clone();
-        async move {
-            seen[0].fetch_add(1, Ordering::SeqCst);
-            if h.contains_key(header::AUTHORIZATION) || h.contains_key(header::COOKIE) {
-                seen[1].fetch_add(1, Ordering::SeqCst);
-            }
-            let (a, b) = h
-                .get(header::RANGE)
-                .and_then(|v| {
-                    v.to_str()
-                        .ok()?
-                        .strip_prefix("bytes=")?
-                        .split_once('-')
-                        .map(|(a, b)| (a.to_string(), b.to_string()))
-                })
-                .map(|(a, b)| {
-                    (
-                        a.parse::<u64>().unwrap(),
-                        if b.is_empty() {
-                            size
-                        } else {
-                            b.parse::<u64>().unwrap() + 1
-                        },
-                    )
-                })
-                .unwrap_or((0, size));
-            // About 4 MiB/s per connection, so several connections pay off.
-            let body = futures_util::stream::unfold(a, move |pos| async move {
-                if pos >= b {
-                    return None;
-                }
-                let n = (b - pos).min(64 << 10);
-                tokio::time::sleep(Duration::from_millis(16)).await;
-                let mut buf = vec![0u8; n as usize];
-                fill(&mut buf, pos);
-                Some((Ok::<_, std::io::Error>(bytes::Bytes::from(buf)), pos + n))
-            });
-            axum::response::Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::ETAG, "\"e\"")
-                .header(header::CONTENT_RANGE, format!("bytes {a}-{}/{size}", b - 1))
-                .header(header::CONTENT_LENGTH, b - a)
-                .body(axum::body::Body::from_stream(body))
-                .unwrap()
-        }
-    });
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/f.bin", l.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-    (url, seen)
-}
+mod common;
+use common::{assert_file, opts, tmpdir};
 
 async fn redirector(to: String) -> String {
     let app = axum::Router::new().fallback(move || {
@@ -109,6 +31,15 @@ async fn redirector(to: String) -> String {
     url
 }
 
+/// Limited per connection, so several connections (and requests) are used.
+fn credentials_server() -> Config {
+    Config {
+        size: 4 << 20,
+        rate_per_conn: Some(4 << 20),
+        ..Config::default()
+    }
+}
+
 fn with_credentials(mut o: Options) -> Options {
     o.headers = vec![
         ("Authorization".into(), "Bearer SECRET".into()),
@@ -120,9 +51,9 @@ fn with_credentials(mut o: Options) -> Options {
 
 #[tokio::test]
 async fn credentials_stay_with_the_origin() {
-    let size = 4 << 20;
-    let (target, seen) = counting_origin(size).await;
-    let start = redirector(target).await;
+    let cfg = credentials_server();
+    let srv = spawn_local(cfg.clone()).await.unwrap();
+    let start = redirector(srv.url()).await;
     let out = tmpdir("creds").join("f.bin");
     download(
         with_credentials(opts(start, &out)),
@@ -131,13 +62,13 @@ async fn credentials_stay_with_the_origin() {
     )
     .await
     .unwrap();
-    assert_file(&out, size);
+    assert_file(&out, cfg.size);
     assert!(
-        seen[0].load(Ordering::SeqCst) > 1,
+        srv.stats.requests.load(Ordering::SeqCst) > 1,
         "expected several range requests"
     );
     assert_eq!(
-        seen[1].load(Ordering::SeqCst),
+        srv.stats.credentialed.load(Ordering::SeqCst),
         0,
         "credentials reached the redirect target"
     );
@@ -145,24 +76,22 @@ async fn credentials_stay_with_the_origin() {
 
 #[tokio::test]
 async fn credentials_still_reach_the_origin_itself() {
-    let size = 4 << 20;
-    let (url, seen) = counting_origin(size).await;
+    let cfg = credentials_server();
+    let srv = spawn_local(cfg.clone()).await.unwrap();
     let out = tmpdir("creds-same").join("f.bin");
     download(
-        with_credentials(opts(url, &out)),
+        with_credentials(opts(srv.url(), &out)),
         None,
         CancellationToken::new(),
     )
     .await
     .unwrap();
-    assert_file(&out, size);
-    let (all, with) = (
-        seen[0].load(Ordering::SeqCst),
-        seen[1].load(Ordering::SeqCst),
-    );
+    assert_file(&out, cfg.size);
+    let all = srv.stats.requests.load(Ordering::SeqCst);
     assert!(all > 1);
     assert_eq!(
-        all, with,
+        srv.stats.credentialed.load(Ordering::SeqCst),
+        all,
         "every request to the origin needs the credentials"
     );
 }
