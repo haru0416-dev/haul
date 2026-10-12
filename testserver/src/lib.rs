@@ -1,4 +1,4 @@
-//! Test origin for pdl: serves a deterministic pseudo-random file and can
+//! Test origin for haul: serves a deterministic pseudo-random file and can
 //! misbehave on demand (per-connection throttling, no Range support,
 //! connection limits, dropped connections, changing ETag).
 

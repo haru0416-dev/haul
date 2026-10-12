@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use pdl::util::{file_name_from_url, parse_size};
-use pdl::{Event, Options, daemon, download};
+use haul::util::{file_name_from_url, parse_size};
+use haul::{Event, Options, daemon, download};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
-#[command(version, about = "Segmented parallel HTTP downloader")]
+#[command(name = "haul", version, about = "Segmented parallel HTTP downloader")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -23,7 +23,7 @@ enum Cmd {
         /// Output path (default: last URL path segment).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Maximum concurrent connections (1-64). pdl starts with one and adds
+        /// Maximum concurrent connections (1-64). haul starts with one and adds
         /// more only while they raise throughput.
         #[arg(short = 'x', long, default_value_t = 16, value_parser = conns_range)]
         connections: usize,
@@ -52,8 +52,8 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:6800")]
         listen: std::net::SocketAddr,
         /// RPC secret; clients pass "token:<secret>" as the first parameter.
-        /// Defaults to $PDL_RPC_SECRET.
-        #[arg(long, env = "PDL_RPC_SECRET", hide_env_values = true)]
+        /// Defaults to $HAUL_RPC_SECRET.
+        #[arg(long, env = "HAUL_RPC_SECRET", hide_env_values = true)]
         secret: Option<String>,
         /// Default download directory.
         #[arg(short, long, default_value = ".")]
@@ -163,7 +163,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             opts.lowest_speed_limit = lowest_speed_limit;
             if let Some(rate) = max_download_limit {
                 opts.limiters
-                    .push(std::sync::Arc::new(pdl::ratelimit::RateLimiter::new(rate)));
+                    .push(std::sync::Arc::new(haul::ratelimit::RateLimiter::new(rate)));
             }
             for h in headers {
                 let (k, v) = h
@@ -221,7 +221,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 session,
             })
             .await?;
-            eprintln!("pdl daemon listening on {}", handle.url());
+            eprintln!("haul daemon listening on {}", handle.url());
             tokio::select! {
                 _ = handle_shutdown_signal() => {}
                 _ = handle.shutdown_requested() => {}

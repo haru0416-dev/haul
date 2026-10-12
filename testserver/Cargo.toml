@@ -1,5 +1,5 @@
 [package]
-name = "pdl-testserver"
+name = "haul-testserver"
 version = "0.1.0"
 edition = "2024"
 

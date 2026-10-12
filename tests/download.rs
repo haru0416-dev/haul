@@ -1,9 +1,9 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use pdl::engine::{part_path, state_path};
-use pdl::{Event, download};
-use pdl_testserver::{Config, spawn_local};
+use haul::engine::{part_path, state_path};
+use haul::{Event, download};
+use haul_testserver::{Config, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -275,7 +275,7 @@ async fn rate_limit_is_respected() {
     .unwrap();
     let out = tmpdir("ratelimit").join("f.bin");
     let mut o = opts(srv.url(), &out);
-    o.limiters = vec![std::sync::Arc::new(pdl::ratelimit::RateLimiter::new(
+    o.limiters = vec![std::sync::Arc::new(haul::ratelimit::RateLimiter::new(
         1 << 20,
     ))];
     let started = std::time::Instant::now();

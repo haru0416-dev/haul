@@ -4,15 +4,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pdl::Options;
-use pdl::engine::{part_path, state_path};
-use pdl_testserver::first_mismatch;
+use haul::Options;
+use haul::engine::{part_path, state_path};
+use haul_testserver::first_mismatch;
 
 /// A fresh directory for one test, on disk under target/ (not a RAM-backed
 /// /tmp), separate per test binary.
 pub fn tmpdir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("pdl-{}-{name}", env!("CARGO_CRATE_NAME")));
+        .join(format!("haul-{}-{name}", env!("CARGO_CRATE_NAME")));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

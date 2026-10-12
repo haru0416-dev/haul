@@ -8,8 +8,8 @@ use std::time::Duration;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::get;
-use pdl::{Options, download};
-use pdl_testserver::{Config, first_mismatch, spawn_local};
+use haul::{Options, download};
+use haul_testserver::{Config, first_mismatch, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -156,7 +156,7 @@ async fn lifting_a_tiny_limit_takes_effect_at_once() {
     };
     let srv = spawn_local(cfg).await.unwrap();
     let out = tmpdir("lift").join("f.bin");
-    let limiter = Arc::new(pdl::ratelimit::RateLimiter::new(4 << 10));
+    let limiter = Arc::new(haul::ratelimit::RateLimiter::new(4 << 10));
     let mut o = Options::new(srv.url(), &out);
     o.limiters = vec![limiter.clone()];
     let task = tokio::spawn(download(o, None, CancellationToken::new()));

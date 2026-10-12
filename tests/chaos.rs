@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::http::{HeaderMap, StatusCode, header};
-use pdl::ratelimit::RateLimiter;
-use pdl_testserver::{byte_at, fill};
+use haul::ratelimit::RateLimiter;
+use haul_testserver::{byte_at, fill};
 use tokio_util::sync::CancellationToken;
 
 struct Rng(u64);
@@ -208,7 +208,7 @@ async fn one(iter: u64, dir: &Path) -> Result<String, String> {
                 "gave up: size={size} chaos={chaos:?} conns={conns} split={min_split} last={last_err}"
             ));
         }
-        let mut o = pdl::Options::new(url.clone(), &out);
+        let mut o = haul::Options::new(url.clone(), &out);
         o.max_conns = conns;
         o.min_split = min_split;
         o.max_retries = 3;
@@ -241,7 +241,7 @@ async fn one(iter: u64, dir: &Path) -> Result<String, String> {
                 flip.set_rate(rate);
             }
         });
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<pdl::Event>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<haul::Event>();
         let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let l2 = log.clone();
         let t0 = std::time::Instant::now();
@@ -255,7 +255,8 @@ async fn one(iter: u64, dir: &Path) -> Result<String, String> {
             }
         });
         let res =
-            tokio::time::timeout(Duration::from_secs(60), pdl::download(o, Some(tx), cancel)).await;
+            tokio::time::timeout(Duration::from_secs(60), haul::download(o, Some(tx), cancel))
+                .await;
         t.abort();
         collector.abort();
         match res {

@@ -3,9 +3,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use pdl::daemon::{self, Handle};
-use pdl::engine::{part_path, state_path};
-use pdl_testserver::{Config, spawn_local};
+use haul::daemon::{self, Handle};
+use haul::engine::{part_path, state_path};
+use haul_testserver::{Config, spawn_local};
 use serde_json::{Value, json};
 
 mod common;
@@ -462,7 +462,7 @@ fn hook_script(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\necho \"$1|$2|$3|$PDL_EVENT|$PDL_ERROR\" >> '{}'\n",
+            "#!/bin/sh\necho \"$1|$2|$3|$HAUL_EVENT|$HAUL_ERROR\" >> '{}'\n",
             log.display()
         ),
     )
@@ -632,7 +632,7 @@ async fn session_survives_restart() {
 #[tokio::test]
 async fn empty_session_file_is_an_empty_session() {
     let dir = tmpdir("emptysession");
-    let session = dir.join("pdl.session");
+    let session = dir.join("haul.session");
     std::fs::write(&session, b"").unwrap();
     let d = start(&dir, |c| c.session = Some(session.clone())).await;
     let stat = ok(&d, "aria2.getGlobalStat", json!([])).await;
@@ -792,17 +792,17 @@ async fn hooks_do_not_get_the_rpc_secret() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\necho \"secret=[$PDL_RPC_SECRET]\" > '{}'\n",
+            "#!/bin/sh\necho \"secret=[$HAUL_RPC_SECRET]\" > '{}'\n",
             log.display()
         ),
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     // SAFETY: set before the daemon starts; tests in this file do not read it.
-    unsafe { std::env::set_var("PDL_RPC_SECRET", "hunter2") };
+    unsafe { std::env::set_var("HAUL_RPC_SECRET", "hunter2") };
     let d = start(&dir, |c| c.hooks.on_complete = Some(script)).await;
     ok(&d, "aria2.addUri", json!([[srv.url()], {"out": "e.bin"}])).await;
     let line = wait_for_file(&log).await;
-    unsafe { std::env::remove_var("PDL_RPC_SECRET") };
+    unsafe { std::env::remove_var("HAUL_RPC_SECRET") };
     assert_eq!(line.trim(), "secret=[]");
 }

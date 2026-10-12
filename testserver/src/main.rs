@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use clap::{Parser, Subcommand};
-use pdl_testserver::{Config, first_mismatch, spawn};
+use haul_testserver::{Config, first_mismatch, spawn};
 
 #[derive(Parser)]
 struct Cli {

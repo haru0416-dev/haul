@@ -4,7 +4,7 @@
 //! (`GET /jsonrpc`); WebSocket clients also receive aria2's
 //! `aria2.onDownload*` notifications. Numbers in responses are strings and
 //! GIDs are 16 hex digits, as in aria2, so existing aria2 front ends and
-//! browser extensions can drive pdl unchanged.
+//! browser extensions can drive haul unchanged.
 //!
 //! Pausing cancels the engine, which leaves a checkpoint; unpausing queues the
 //! download again and the engine resumes from that checkpoint.
@@ -47,7 +47,7 @@ pub struct Config {
     /// browser extensions are always allowed.
     pub allowed_origins: Vec<String>,
     /// Commands run on download events, called like aria2's hooks:
-    /// `<command> <gid> 1 <path>`, plus PDL_* environment variables.
+    /// `<command> <gid> 1 <path>`, plus HAUL_* environment variables.
     pub hooks: Hooks,
     /// Daemon-wide speed cap in bytes per second (0 = unlimited).
     pub max_overall_download_limit: u64,
@@ -280,7 +280,7 @@ pub async fn spawn(config: Config) -> anyhow::Result<Handle> {
                 // Pause active downloads so each leaves a checkpoint.
                 stop_all(&d).await;
                 if let Err(e) = save_session(&d) {
-                    eprintln!("pdl: saving session failed: {e:#}");
+                    eprintln!("haul: saving session failed: {e:#}");
                 }
             };
             let writer = session_writer(&d, shutdown.clone());
@@ -541,20 +541,20 @@ fn run_hook(d: &Daemon, method: &str, gid: &str, info: HookInfo) {
     c.arg(gid)
         .arg("1")
         .arg(&path)
-        .env("PDL_EVENT", event)
-        .env("PDL_GID", gid)
-        .env("PDL_PATH", &path)
-        .env("PDL_URI", &uri)
-        .env("PDL_ERROR", error.unwrap_or_default())
+        .env("HAUL_EVENT", event)
+        .env("HAUL_GID", gid)
+        .env("HAUL_PATH", &path)
+        .env("HAUL_URI", &uri)
+        .env("HAUL_ERROR", error.unwrap_or_default())
         // Hooks need no RPC access; do not hand them the secret.
-        .env_remove("PDL_RPC_SECRET")
+        .env_remove("HAUL_RPC_SECRET")
         .stdin(std::process::Stdio::null());
     let gid = gid.to_string();
     tokio::spawn(async move {
         match c.status().await {
             Ok(st) if st.success() => {}
-            Ok(st) => eprintln!("pdl: {event} hook for {gid} exited with {st}"),
-            Err(e) => eprintln!("pdl: {event} hook {} failed to start: {e}", cmd.display()),
+            Ok(st) => eprintln!("haul: {event} hook for {gid} exited with {st}"),
+            Err(e) => eprintln!("haul: {event} hook {} failed to start: {e}", cmd.display()),
         }
     });
 }
@@ -602,7 +602,7 @@ async fn session_writer(d: &Daemon, stop: CancellationToken) {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
         if let Err(e) = save_session(d) {
-            eprintln!("pdl: saving session failed: {e:#}");
+            eprintln!("haul: saving session failed: {e:#}");
         }
     }
 }
@@ -670,7 +670,7 @@ fn restore_session(d: &Daemon, path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let file: SessionFile = serde_json::from_slice(&data)
-        .map_err(|e| anyhow::anyhow!("{} is not a pdl session: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("{} is not a haul session: {e}", path.display()))?;
     anyhow::ensure!(
         file.version == SESSION_VERSION,
         "{}: unsupported session version {}",
@@ -1169,7 +1169,7 @@ fn call_method(d: &Daemon, method: &str, mut params: Vec<Value>) -> RpcResult {
             // Reported as aria2 so front ends enable their aria2 code paths.
             "version": "1.37.0",
             "enabledFeatures": ["HTTPS"],
-            "pdlVersion": env!("CARGO_PKG_VERSION"),
+            "haulVersion": env!("CARGO_PKG_VERSION"),
         })),
         "aria2.getSessionInfo" => Ok(json!({"sessionId": d.session_id})),
         "aria2.saveSession" => {
@@ -1274,12 +1274,12 @@ fn opt_path(opts: &Map<String, Value>, key: &str) -> Result<Option<PathBuf>, Rpc
     }
 }
 
-/// aria2 options that pdl does not implement and whose absence would make
+/// aria2 options that haul does not implement and whose absence would make
 /// a "complete" mean something else (a checksum that was never verified).
 /// Other unknown options are ignored, as front ends send many.
 fn check_supported(opts: &Map<String, Value>) -> Result<(), RpcError> {
     if opts.get("checksum").is_some_and(|v| v.as_str() != Some("")) {
-        return Err(fail("option checksum is not supported by pdl"));
+        return Err(fail("option checksum is not supported by haul"));
     }
     Ok(())
 }

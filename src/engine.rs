@@ -841,7 +841,7 @@ fn same_origin(a: &str, b: &str) -> bool {
 fn build_client(opts: &Options, headers: &HeaderMap) -> anyhow::Result<Client> {
     Ok(Client::builder()
         .tls_backend_preconfigured(tls_config()?)
-        .user_agent(concat!("pdl/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("haul/", env!("CARGO_PKG_VERSION")))
         .default_headers(headers.clone())
         .connect_timeout(opts.connect_timeout)
         .read_timeout(opts.read_timeout)

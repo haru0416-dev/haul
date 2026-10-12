@@ -1,7 +1,16 @@
 [package]
-name = "pdl"
+# "haul" is taken on crates.io; the library and the command are still `haul`.
+name = "haul-dl"
 version = "0.1.0"
 edition = "2024"
+description = "Segmented parallel HTTP downloader with an aria2-compatible daemon"
+
+[lib]
+name = "haul"
+
+[[bin]]
+name = "haul"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -22,7 +31,7 @@ tokio-util = "0.7.20"
 members = ["testserver"]
 
 [dev-dependencies]
-pdl-testserver = { path = "testserver" }
+haul-testserver = { path = "testserver" }
 tokio-tungstenite = "0.30.0"
 
 [profile.profiling]
