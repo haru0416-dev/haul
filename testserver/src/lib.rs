@@ -69,6 +69,10 @@ pub struct Config {
     /// Bottleneck shared by all responses, bytes per second (the client's
     /// link). Each chunk takes its turn on it.
     pub link: Option<u64>,
+    /// Responses (1-based, as `slow_requests`) that stop sending after 64 KiB
+    /// (or halfway, if shorter) for a minute without closing: a stalled
+    /// connection.
+    pub stall_requests: Vec<u64>,
 }
 
 impl Default for Config {
@@ -94,6 +98,7 @@ impl Default for Config {
             latency: Duration::ZERO,
             rtt: Duration::ZERO,
             link: None,
+            stall_requests: Vec::new(),
         }
     }
 }
@@ -369,6 +374,10 @@ fn handle(
         next: Instant::now(),
         state: state.clone(),
         conn: conn.clone(),
+        stall_at: cfg
+            .stall_requests
+            .contains(&served)
+            .then(|| ((end - start) / 2).min(64 << 10)),
     };
     let s = stream::unfold(body, |mut b| async move {
         if b.pos >= b.end {
@@ -376,6 +385,10 @@ fn handle(
         }
         if b.drop_after.is_some_and(|d| b.sent >= d) {
             return Some((Err(std::io::Error::other("dropped")), b));
+        }
+        if b.stall_at.is_some_and(|at| b.sent >= at) {
+            b.stall_at = None;
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
         let len = (b.end - b.pos).min(b.chunk as u64) as usize;
         let rtt = b.state.config.rtt;
@@ -443,6 +456,7 @@ struct BodyState {
     next: Instant,
     state: Arc<State>,
     conn: Arc<Conn>,
+    stall_at: Option<u64>,
 }
 
 struct ActiveGuard(Arc<Stats>);

@@ -476,3 +476,94 @@ async fn retried_first_request_still_goes_parallel() {
     let active = srv.stats.max_active.load(Ordering::SeqCst);
     assert!(active > 4, "stayed at {active} connection(s)");
 }
+
+/// On a path one connection already fills, more connections are tried,
+/// found useless and actually closed again, also when the step reached the
+/// maximum (which used to go unjudged).
+#[tokio::test]
+async fn useless_extra_connections_are_closed_again() {
+    let cfg = Config {
+        size: 3 << 20,
+        // A shared 512 KiB/s link: one connection already gets all of it
+        // (slow enough that the test server's per-chunk overhead is noise,
+        // even with other tests loading the machine).
+        link: Some(512 << 10),
+        ..Config::default()
+    };
+    let srv = spawn_local(cfg.clone()).await.unwrap();
+    let out = tmpdir("steer-back").join("f.bin");
+    let mut o = opts(srv.url(), &out);
+    o.max_conns = 4;
+    o.progress_interval = Duration::from_millis(100);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    download(o, Some(tx), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_file(&out, cfg.size);
+    let mut conns = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let Event::Progress { connections, .. } = ev {
+            conns.push(connections);
+        }
+    }
+    assert!(conns.iter().any(|&c| c > 1), "never tried more: {conns:?}");
+    // The last second (10 samples) runs on one connection.
+    let tail = &conns[conns.len().saturating_sub(10)..];
+    assert!(
+        tail.iter().all(|&c| c <= 1),
+        "extra connections kept: {conns:?}"
+    );
+}
+
+/// A connection that stops delivering without closing must have its range
+/// taken over long before the read timeout notices it.
+#[tokio::test]
+async fn stalled_connection_is_rescued() {
+    let cfg = Config {
+        size: 16 << 20,
+        rate_per_conn: Some(2 << 20),
+        // The second response (the first after the probe's) stalls halfway.
+        stall_requests: vec![2],
+        ..Config::default()
+    };
+    let srv = spawn_local(cfg.clone()).await.unwrap();
+    let out = tmpdir("stall").join("f.bin");
+    let t = std::time::Instant::now();
+    download(opts(srv.url(), &out), None, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_file(&out, cfg.size);
+    // Well under the 30 s read timeout and the 60 s stall.
+    assert!(
+        t.elapsed() < Duration::from_secs(12),
+        "took {:?}",
+        t.elapsed()
+    );
+}
+
+/// After `steer` went back to one connection, that one stalling must still
+/// be rescued: a stalled worker must not hold the only slot.
+#[tokio::test]
+async fn stall_after_going_back_to_one_connection_is_rescued() {
+    let cfg = Config {
+        size: 4 << 20,
+        link: Some(512 << 10),
+        // Requests after the 1 -> 4 step and back stall without closing.
+        stall_requests: vec![5, 6, 7],
+        ..Config::default()
+    };
+    let srv = spawn_local(cfg.clone()).await.unwrap();
+    let out = tmpdir("stall-after-back").join("f.bin");
+    let mut o = opts(srv.url(), &out);
+    o.max_conns = 4;
+    o.read_timeout = Duration::from_secs(20);
+    let t = std::time::Instant::now();
+    download(o, None, CancellationToken::new()).await.unwrap();
+    assert_file(&out, cfg.size);
+    // 4 MiB at 512 KiB/s is 8 s; a stall waited out would add 20 s.
+    assert!(
+        t.elapsed() < Duration::from_secs(16),
+        "took {:?}",
+        t.elapsed()
+    );
+}
