@@ -13,7 +13,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,157 @@ struct Seg {
 struct Plan {
     segs: Vec<Seg>,
     alive: Vec<bool>,
+    /// Per worker: how fast its connection delivers.
+    rates: Vec<Rate>,
+    /// Smoothed time from sending a request to its first byte, in seconds:
+    /// what a worker loses before a newly taken range starts flowing.
+    latency: f64,
+    /// The same for a worker without a usable connection, which first has
+    /// to connect (TCP and TLS handshakes): from the probe at first, then
+    /// from the requests that opened connections.
+    connect_latency: f64,
+    /// `latency` has been measured, not just derived from the probe.
+    latency_measured: bool,
+}
+
+/// A connection's delivery speed, an exponential moving average over the
+/// time its responses were actually streaming (idle gaps are not counted).
+#[derive(Clone, Default)]
+struct Rate {
+    /// Bytes per second; 0 until the first sample.
+    bps: f64,
+    /// Start of the current sample, while a response is streaming.
+    since: Option<Instant>,
+    bytes: u64,
+    /// The connection has carried a response before, so its next request
+    /// pays one round trip, not a handshake.
+    reused: bool,
+    /// When the current connection delivered its first response; while it
+    /// is young, TCP slow start keeps it below its eventual speed.
+    born: Option<Instant>,
+    /// When the connection last delivered bytes.
+    last: Option<Instant>,
+}
+
+/// The worker a split would hand work to, and how long it needs for it.
+struct Thief {
+    /// It has a live connection (else it must connect first).
+    connected: bool,
+    /// Bytes per second once flowing.
+    speed: f64,
+    /// Time to first byte on a live connection.
+    latency: f64,
+    /// Time to first byte when connecting first.
+    connect: f64,
+    rtt: f64,
+}
+
+impl Thief {
+    /// Seconds until it has delivered `x` bytes. A new connection pays its
+    /// handshakes and then slow start: after k round trips it has delivered
+    /// IW (2^k - 1) bytes, until its window carries `speed` per round trip.
+    fn time(&self, x: f64) -> f64 {
+        if self.connected {
+            return self.latency + x / self.speed;
+        }
+        let iw = INITIAL_WINDOW;
+        // Bytes delivered by the time slow start reaches `speed`.
+        let full = (self.speed * self.rtt).max(iw);
+        let ramp_bytes = full - iw;
+        let ramp = if x <= ramp_bytes {
+            self.rtt * (1.0 + x / iw).log2()
+        } else {
+            self.rtt * (full / iw).log2() + (x - ramp_bytes) / self.speed
+        };
+        self.connect + ramp
+    }
+
+    /// The share `x` of a victim's `r` remaining bytes (at `v` bytes per
+    /// second) that makes both finish together: `time(x) = (r - x) / v`.
+    /// `time` is increasing, so the root is found by bisection; 0 when the
+    /// thief could not even start before the victim is done.
+    fn balance(&self, r: f64, v: f64) -> f64 {
+        let gap = |x: f64| self.time(x) - (r - x) / v;
+        if gap(0.0) >= 0.0 {
+            return 0.0;
+        }
+        let (mut lo, mut hi) = (0.0, r);
+        for _ in 0..50 {
+            let mid = (lo + hi) / 2.0;
+            if gap(mid) < 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+/// What a worker should do next.
+enum Claim {
+    Work(usize),
+    /// Everything left is in progress and not worth splitting now; ask
+    /// again shortly, since speeds change.
+    Wait,
+    /// Nothing left.
+    Done,
+}
+
+/// How often a waiting worker looks for work again.
+const WAIT_POLL: Duration = Duration::from_millis(100);
+/// Smallest range taken from another worker once speeds are known (or the
+/// user's minimum split, if smaller). Below it a request costs more than it
+/// moves, except to rescue a stalled connection.
+const STEAL_FLOOR: u64 = 64 << 10;
+/// A split that brings its victim's predicted end forward by at least this
+/// much is made whatever its size: the victim has all but stalled.
+const RESCUE_SAVING: f64 = 1.0;
+/// A new TCP connection's first flight (Linux's initial window of ten
+/// segments); slow start doubles it every round trip.
+const INITIAL_WINDOW: f64 = 14600.0;
+/// Round trips after which a connection's measured speed is taken as its
+/// steady speed (slow start is over by then on any realistic path).
+const WARM_RTTS: f64 = 10.0;
+
+/// Samples shorter than this are merged into the next one.
+const RATE_SAMPLE: Duration = Duration::from_millis(200);
+/// Time constant of the speed average.
+const RATE_TAU: f64 = 1.0;
+
+/// Idle time after which a kept-alive connection is assumed closed by the
+/// server (Apache's default KeepAliveTimeout is 5 s).
+const KEEPALIVE: Duration = Duration::from_secs(4);
+
+impl Rate {
+    fn start(&mut self, now: Instant) {
+        self.since = Some(now);
+        self.last = Some(now);
+        self.bytes = 0;
+    }
+
+    /// The worker holds a connection its next request can reuse.
+    fn live(&self, now: Instant) -> bool {
+        self.reused && self.last.is_none_or(|t| now.duration_since(t) < KEEPALIVE)
+    }
+
+    fn add(&mut self, n: u64, now: Instant) {
+        let Some(since) = self.since else { return };
+        self.last = Some(now);
+        self.bytes += n;
+        let dt = now.duration_since(since);
+        if dt < RATE_SAMPLE {
+            return;
+        }
+        let dt = dt.as_secs_f64();
+        let inst = self.bytes as f64 / dt;
+        self.bps = if self.bps == 0.0 {
+            inst
+        } else {
+            self.bps + (1.0 - (-dt / RATE_TAU).exp()) * (inst - self.bps)
+        };
+        self.start(now);
+    }
 }
 
 impl Plan {
@@ -169,6 +320,9 @@ struct Shared {
     size: u64,
     min_split: u64,
     max_retries: u32,
+    /// How many workers may be streaming at once; raised by `steer` while
+    /// more connections keep paying off.
+    target: AtomicUsize,
     file: Arc<File>,
     plan: Mutex<Plan>,
     cancel: CancellationToken,
@@ -186,45 +340,165 @@ impl Shared {
         f(&mut self.plan.lock().unwrap().segs[i])
     }
 
-    /// Picks an unowned segment, or splits the largest one being worked on.
-    /// When there is nothing to do, the worker is marked as gone.
-    fn claim(&self, id: usize) -> Option<usize> {
+    /// Picks an unowned segment, or splits one being worked on. When
+    /// nothing is left at all, the worker is marked as gone.
+    fn claim(&self, id: usize) -> Claim {
         let mut plan = self.plan.lock().unwrap();
-        let r = Self::claim_locked(&mut plan.segs, id, self.min_split);
-        if r.is_none() {
-            plan.alive[id] = false;
+        // Workers streaming now; `target` caps them (see `steer`).
+        let busy = plan
+            .segs
+            .iter()
+            .filter(|s| s.owner.is_some() && s.written < s.end)
+            .count();
+        if busy < self.target.load(Ordering::Relaxed) {
+            if let Some(seg) = Self::claim_locked(&mut plan, id, self.min_split) {
+                return Claim::Work(seg);
+            }
         }
-        r
+        if plan.segs.iter().any(|s| s.written < s.end) {
+            return Claim::Wait;
+        }
+        plan.alive[id] = false;
+        Claim::Done
     }
 
-    fn claim_locked(segs: &mut Vec<Seg>, id: usize, min_split: u64) -> Option<usize> {
-        if let Some(i) = segs
+    /// Gives worker `id` work: an unowned range if there is one, else the
+    /// tail of the range predicted to finish last.
+    ///
+    /// The download ends when its last range does, so a split should bring
+    /// that time forward as far as possible. A victim with `r` bytes left at
+    /// speed `v` finishes in `r / v`. If the thief takes the last `x` bytes,
+    /// the victim needs `(r - x) / v` and the thief `T(x)`; both end together,
+    /// the best either can do, where `T(x) = (r - x) / v`. For a thief with
+    /// a live connection `T(x) = l + x / t` (round trip `l`, speed `t`),
+    /// giving `x = t (r - v l) / (v + t)`: halving when speeds are equal and
+    /// `l` is 0, and nothing when the victim is done within `l`. A thief that
+    /// must connect first also pays the handshakes and slow start (see
+    /// `Thief::time`), which makes it take less. Before any speed is known,
+    /// ranges are halved.
+    fn claim_locked(plan: &mut Plan, id: usize, min_split: u64) -> Option<usize> {
+        if let Some(i) = plan
+            .segs
             .iter()
             .position(|s| s.owner.is_none() && s.written < s.end)
         {
-            segs[i].owner = Some(id);
+            plan.segs[i].owner = Some(id);
             return Some(i);
         }
-        let (i, remain) = segs
+        let known: Vec<f64> = plan
+            .rates
             .iter()
-            .enumerate()
-            .filter(|(_, s)| s.owner.is_some())
-            .map(|(i, s)| (i, s.end - s.fetched))
-            .max_by_key(|&(_, r)| r)?;
-        if remain < 2 * min_split {
-            return None;
-        }
-        let victim = &mut segs[i];
-        let mid = victim.fetched + remain / 2;
+            .map(|r| r.bps)
+            .filter(|&b| b > 0.0)
+            .collect();
+        let (i, x) = if known.is_empty() {
+            let (i, remain) = plan
+                .segs
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.owner.is_some())
+                .map(|(i, s)| (i, s.end - s.fetched))
+                .max_by_key(|&(_, r)| r)?;
+            if remain < 2 * min_split {
+                return None;
+            }
+            (i, remain - remain / 2)
+        } else {
+            let rtt = plan.latency.max(0.001);
+            let now = Instant::now();
+            let warm = |w: usize| {
+                plan.rates[w]
+                    .born
+                    .is_some_and(|b| now.duration_since(b).as_secs_f64() >= WARM_RTTS * rtt)
+            };
+            let steady: Vec<f64> = (0..plan.rates.len())
+                .filter(|&w| warm(w) && plan.rates[w].bps > 0.0)
+                .map(|w| plan.rates[w].bps)
+                .collect();
+            let pool = if steady.is_empty() { &known } else { &steady };
+            let mean = pool.iter().sum::<f64>() / pool.len() as f64;
+            // A young connection is still ramping up: judge it by what an
+            // established one does, not by its first slow round trips.
+            let speed = |w: usize| match plan.rates[w].bps {
+                b if b > 0.0 && warm(w) => b,
+                b => b.max(mean),
+            };
+            let (i, remain, v) = plan
+                .segs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| Some((i, s.end - s.fetched, speed(s.owner?))))
+                .filter(|&(_, r, _)| r > 0)
+                .max_by(|a, b| (a.1 as f64 / a.2).total_cmp(&(b.1 as f64 / b.2)))?;
+            let r = remain as f64;
+            let thief = Thief {
+                connected: plan.rates[id].live(now),
+                speed: speed(id),
+                latency: plan.latency,
+                connect: plan.connect_latency,
+                rtt,
+            };
+            let x = thief.balance(r, v);
+            // The victim now ends x / v sooner, and so does the download if
+            // it was the last to finish.
+            let saving = x / v;
+            if x < 1.0 || (x < min_split.min(STEAL_FLOOR) as f64 && saving < RESCUE_SAVING) {
+                return None;
+            }
+            (i, (x as u64).clamp(1, remain))
+        };
+        let victim = &mut plan.segs[i];
+        let cut = victim.end - x;
         let end = victim.end;
-        victim.end = mid;
-        segs.push(Seg {
-            fetched: mid,
-            written: mid,
+        victim.end = cut;
+        plan.segs.push(Seg {
+            fetched: cut,
+            written: cut,
             end,
             owner: Some(id),
         });
-        Some(segs.len() - 1)
+        Some(plan.segs.len() - 1)
+    }
+
+    /// The worker's connection is gone; its next one is of unknown speed.
+    fn forget_rate(&self, id: usize) {
+        self.plan.lock().unwrap().rates[id] = Rate::default();
+    }
+
+    /// Records a request's time to first byte. Only requests on reused
+    /// connections count: a split hands work to a worker that is already
+    /// connected, and handshakes would inflate the estimate several times.
+    fn observe_latency(&self, id: usize, secs: f64) {
+        let mut plan = self.plan.lock().unwrap();
+        let now = Instant::now();
+        let rate = &mut plan.rates[id];
+        let was_live = rate.live(now);
+        rate.reused = true;
+        if was_live {
+            plan.latency = if plan.latency_measured {
+                0.7 * plan.latency + 0.3 * secs
+            } else {
+                secs
+            };
+            plan.latency_measured = true;
+        } else {
+            // This request opened a connection: what that costs here, free
+            // of the probe's DNS lookup, redirects and retries.
+            rate.born = Some(now);
+            plan.connect_latency = 0.5 * plan.connect_latency + 0.5 * secs;
+            if !plan.latency_measured {
+                plan.latency = plan.connect_latency / 3.0;
+            }
+        }
+    }
+
+    /// Workers streaming a range (waiting ones are not counted).
+    fn active(&self) -> usize {
+        let plan = self.plan.lock().unwrap();
+        plan.segs
+            .iter()
+            .filter(|s| s.owner.is_some() && s.written < s.end)
+            .count()
     }
 
     fn release_locked(plan: &mut Plan, seg: usize) {
@@ -251,10 +525,6 @@ impl Shared {
         Self::release_locked(&mut plan, seg);
         plan.alive[id] = false;
         true
-    }
-
-    fn workers(&self) -> usize {
-        self.plan.lock().unwrap().workers()
     }
 
     /// For the last live worker, whose server has stopped honouring Range:
@@ -338,9 +608,14 @@ impl SegError {
 }
 
 /// One TLS configuration for the whole process. Each worker gets its own
-/// `Client` (so HTTP/2 cannot fold the connections into one), and building
-/// the verifier per client would re-read the system certificate store every
-/// time; the config is cheap to clone because its parts are shared.
+/// `Client` (its own connection), and building the verifier per client would
+/// re-read the system certificate store every time; the config is cheap to
+/// clone because its parts are shared.
+///
+/// Only HTTP/1.1 is offered. Each connection carries one response at a time,
+/// so HTTP/2 multiplexing has nothing to offer, while its flow-control window
+/// caps a connection at window / RTT (measured on Google's CDN: HTTP/2 held
+/// at ~60 MB/s where HTTP/1.1, left to TCP's own window, reached 100-140).
 fn tls_config() -> anyhow::Result<rustls::ClientConfig> {
     static CONFIG: std::sync::OnceLock<Result<rustls::ClientConfig, String>> =
         std::sync::OnceLock::new();
@@ -355,7 +630,7 @@ fn tls_config() -> anyhow::Result<rustls::ClientConfig> {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
-            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
             Ok(config)
         })
         .clone()
@@ -485,6 +760,8 @@ async fn probe_retrying(
 
 struct Probe {
     resp: Response,
+    /// Seconds from sending the (successful) request to its response.
+    latency: f64,
     final_url: String,
     /// Total size when the server answered 206 with a known length.
     ranged_size: Option<u64>,
@@ -499,6 +776,7 @@ async fn probe(
     url: &str,
     if_range: Option<&str>,
 ) -> anyhow::Result<Probe> {
+    let started = Instant::now();
     let mut req = client
         .get(url)
         .headers(secret.clone())
@@ -526,6 +804,7 @@ async fn probe(
     };
     let validator = validator(resp.headers());
     Ok(Probe {
+        latency: started.elapsed().as_secs_f64(),
         final_url: resp.url().to_string(),
         resp,
         ranged_size,
@@ -709,6 +988,7 @@ pub async fn download(
     };
     let Probe {
         resp: mut probe_resp,
+        latency: probe_latency,
         final_url,
         ranged_size,
         validator,
@@ -872,10 +1152,27 @@ pub async fn download(
         size,
         min_split: opts.min_split.max(1),
         max_retries: opts.max_retries,
+        target: AtomicUsize::new(1),
         file: Arc::new(file),
         plan: Mutex::new(Plan {
             segs,
             alive: vec![true; max_conns],
+            rates: {
+                let mut rates = vec![Rate::default(); max_conns];
+                if first_resp.is_some() {
+                    // Worker 0 streams the probe's response: connected now.
+                    let now = Instant::now();
+                    rates[0].reused = true;
+                    rates[0].born = Some(now);
+                    rates[0].last = Some(now);
+                }
+                rates
+            },
+            // The probe also paid for DNS and the TCP and TLS handshakes,
+            // roughly three round trips in all.
+            latency: probe_latency / 3.0,
+            connect_latency: probe_latency,
+            latency_measured: false,
         }),
         cancel: cancel.clone(),
         events: events.clone(),
@@ -918,9 +1215,10 @@ pub async fn download(
     let ticker = {
         let shared = shared.clone();
         spawn_progress(&opts, events.clone(), Some(size), move || {
-            (shared.received(), shared.workers())
+            (shared.received(), shared.active())
         })
     };
+    let steering = AbortOnDrop(tokio::spawn(steer(shared.clone(), max_conns)));
 
     let mut workers = tokio::task::JoinSet::new();
     let mut first_resp = first_resp;
@@ -954,7 +1252,11 @@ pub async fn download(
     }
     stop_checkpoints.cancel();
     let _ = checkpointer.await;
-    drop(ticker);
+    // Both hold the shared state, and so the partial file and its lock: they
+    // must be gone before this returns, or a download started right after
+    // (a quick pause and resume) would find the file still locked.
+    ticker.stop().await;
+    steering.stop().await;
 
     let remaining = shared.remaining();
     if result.is_ok() && !remaining.is_empty() {
@@ -1005,8 +1307,72 @@ async fn checkpoint(shared: &Arc<Shared>, path: &Path, url: &str) -> anyhow::Res
     Ok(())
 }
 
+/// Factor by which `steer` multiplies the number of connections per step.
+const STEER_STEP: usize = 4;
+/// Throughput a step must add to be kept: on a path one connection already
+/// fills, more connections only add handshakes, slow starts and losses.
+const STEER_GAIN: f64 = 1.25;
+
+/// Chooses how many connections to use by measuring what they deliver.
+///
+/// Total throughput is a concave function of the number of connections:
+/// it grows while the server limits each connection, and flattens (or
+/// falls, as parallel slow starts overshoot the bottleneck) once the path
+/// is full. So start with one, and once throughput has settled, multiply by
+/// `STEER_STEP`; keep a step only if throughput rose by `STEER_GAIN`, else
+/// go back and stop. Stop as well when what is left would be done before
+/// new connections could get up to speed.
+async fn steer(shared: Arc<Shared>, max: usize) {
+    let (mut n, mut prev) = (1usize, 1usize);
+    let mut base: Option<f64> = None;
+    let mut changed = Instant::now();
+    let mut last = (Instant::now(), shared.received());
+    let mut last_rate = 0.0;
+    while n < max {
+        let (rtt, connect) = {
+            let p = shared.plan.lock().unwrap();
+            (p.latency.max(0.001), p.connect_latency)
+        };
+        let window = (2.0 * rtt).max(0.15);
+        tokio::time::sleep(Duration::from_secs_f64(window)).await;
+        let now = Instant::now();
+        let got = shared.received();
+        let rate = got.saturating_sub(last.1) as f64 / now.duration_since(last.0).as_secs_f64();
+        last = (now, got);
+        // Settled: the newest connections had time to connect, and the
+        // total stopped climbing (slow start is over).
+        let climbing = rate > 1.1 * last_rate;
+        last_rate = rate;
+        if now.duration_since(changed).as_secs_f64() < connect + 2.0 * window || climbing {
+            continue;
+        }
+        if base.is_some_and(|b| rate < STEER_GAIN * b) {
+            shared.target.store(prev, Ordering::Relaxed);
+            return;
+        }
+        let left = shared.size.saturating_sub(got) as f64;
+        if left < rate * (connect + WARM_RTTS * rtt) {
+            return;
+        }
+        base = Some(rate);
+        prev = n;
+        n = (n * STEER_STEP).min(max);
+        shared.target.store(n, Ordering::Relaxed);
+        changed = now;
+    }
+}
+
 /// A task aborted when dropped, so no return path can leave it running.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    /// Aborts the task and waits until it is gone, along with whatever it
+    /// held (abort alone only takes effect at the task's next poll).
+    async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -1178,15 +1544,21 @@ async fn worker_loop(
         let (seg, mut resp) = match initial.take() {
             Some((seg, resp)) => (seg, Some(resp)),
             None => match shared.claim(id) {
-                Some(seg) => (seg, None),
-                None => return Ok(()),
+                Claim::Work(seg) => (seg, None),
+                Claim::Done => return Ok(()),
+                Claim::Wait => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(WAIT_POLL) => continue,
+                        _ = shared.cancel.cancelled() => return Ok(()),
+                    }
+                }
             },
         };
         // Failures in a row without any new bytes written.
         let mut failures = 0u32;
         loop {
             let before = shared.seg(seg, |s| s.written);
-            let err = match fetch_segment(client, shared, seg, resp.take()).await {
+            let err = match fetch_segment(id, client, shared, seg, resp.take()).await {
                 Ok(()) => break,
                 Err(SegError::Cancelled) => {
                     shared.leave(id, seg);
@@ -1243,6 +1615,7 @@ async fn worker_loop(
 
 /// Streams one segment until its (possibly shrinking) end.
 async fn fetch_segment(
+    id: usize,
     client: &Client,
     shared: &Shared,
     seg: usize,
@@ -1259,11 +1632,11 @@ async fn fetch_segment(
         Some(r) => r,
         None => {
             let url = shared.url.read().unwrap().clone();
-            let r = match request_range(client, shared, &url, from, to).await {
+            let r = match request_range(id, client, shared, &url, from, to).await {
                 // A signed or temporary redirect target has expired: resolve
                 // the original URL again and keep using what it points to now.
                 Err(SegError::Expired(_)) if url != shared.origin_url => {
-                    let resp = request_range(client, shared, &shared.origin_url, from, to)
+                    let resp = request_range(id, client, shared, &shared.origin_url, from, to)
                         .await
                         .map_err(|e| e.expired_as_final())?;
                     if !same_resource(shared, &url, &resp) {
@@ -1296,6 +1669,7 @@ async fn fetch_segment(
         }
     };
 
+    shared.plan.lock().unwrap().rates[id].start(Instant::now());
     let mut buf = Pending::default();
     let mut write_pos = from;
     let mut last_flush = Instant::now();
@@ -1317,6 +1691,7 @@ async fn fetch_segment(
                 let limited = window.2 || throttled();
                 if !limited && speed < shared.lowest_speed_limit as f64 {
                     flush(shared, seg, &mut buf, &mut write_pos).await.map_err(SegError::Fatal)?;
+                    shared.forget_rate(id);
                     return Err(SegError::Retry(anyhow!(
                         "connection too slow ({} B/s); reconnecting",
                         speed as u64
@@ -1333,6 +1708,7 @@ async fn fetch_segment(
                     .await
                     .map_err(SegError::Fatal)?;
                 if shared.seg(seg, |s| s.written < s.end) {
+                    shared.forget_rate(id);
                     return Err(SegError::Retry(anyhow!("connection closed early")));
                 }
                 return Ok(());
@@ -1341,6 +1717,7 @@ async fn fetch_segment(
                 flush(shared, seg, &mut buf, &mut write_pos)
                     .await
                     .map_err(SegError::Fatal)?;
+                shared.forget_rate(id);
                 return Err(SegError::Retry(e.into()));
             }
         };
@@ -1353,11 +1730,15 @@ async fn fetch_segment(
                 continue;
             }
         }
-        let (take, done) = shared.seg(seg, |s| {
+        let (take, done) = {
+            let mut plan = shared.plan.lock().unwrap();
+            let s = &mut plan.segs[seg];
             let take = (s.end - s.fetched).min(chunk.len() as u64);
             s.fetched += take;
-            (take as usize, s.fetched == s.end)
-        });
+            let done = s.fetched == s.end;
+            plan.rates[id].add(take, Instant::now());
+            (take as usize, done)
+        };
         buf.push(chunk.slice(..take));
         window.1 += take as u64;
         // Checked per chunk, so the unlimited case must stay a few loads.
@@ -1378,7 +1759,12 @@ async fn fetch_segment(
             last_flush = Instant::now();
         }
         if done {
-            // Dropping `resp` here closes a connection whose range was cut short.
+            // Dropping `resp` here closes a connection whose range was cut
+            // short; the next request goes out on a new one, whose speed is
+            // not this one's.
+            if shared.seg(seg, |s| s.end) < to {
+                shared.forget_rate(id);
+            }
             return Ok(());
         }
     }
@@ -1393,6 +1779,24 @@ async fn throttle(limiters: &[Arc<RateLimiter>], n: u64) {
 /// Sends one Range request for `[from, to)` and checks the response is that
 /// range of the same file.
 async fn request_range(
+    id: usize,
+    client: &Client,
+    shared: &Shared,
+    url: &str,
+    from: u64,
+    to: u64,
+) -> Result<Response, SegError> {
+    let r = send_range(id, client, shared, url, from, to).await;
+    // A refused or unusable response is dropped unread, which closes its
+    // connection; so does a failed send.
+    if matches!(&r, Err(e) if !matches!(e, SegError::Cancelled)) {
+        shared.forget_rate(id);
+    }
+    r
+}
+
+async fn send_range(
+    id: usize,
     client: &Client,
     shared: &Shared,
     url: &str,
@@ -1408,10 +1812,12 @@ async fn request_range(
     if let Some(v) = &shared.validator {
         req = req.header(header::IF_RANGE, v);
     }
+    let sent = Instant::now();
     let resp = tokio::select! {
         r = req.send() => r.map_err(|e| SegError::Retry(e.into()))?,
         _ = shared.cancel.cancelled() => return Err(SegError::Cancelled),
     };
+    shared.observe_latency(id, sent.elapsed().as_secs_f64());
     match resp.status() {
         StatusCode::PARTIAL_CONTENT => {}
         StatusCode::OK => {

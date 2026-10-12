@@ -23,10 +23,12 @@ enum Cmd {
         /// Output path (default: last URL path segment).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Maximum concurrent connections (1-64).
+        /// Maximum concurrent connections (1-64). pdl starts with one and adds
+        /// more only while they raise throughput.
         #[arg(short = 'x', long, default_value_t = 16, value_parser = conns_range)]
         connections: usize,
-        /// Do not split ranges smaller than twice this size (e.g. 1M, 512K).
+        /// Before speeds are known, do not split ranges smaller than twice
+        /// this size (e.g. 1M, 512K). Later splits follow measured speeds.
         #[arg(short = 'k', long, default_value = "1M", value_parser = parse_size)]
         min_split: u64,
         /// Extra request header, "Name: value". Repeatable.
@@ -59,7 +61,8 @@ enum Cmd {
         /// Downloads that run at the same time.
         #[arg(short = 'j', long, default_value_t = 5)]
         max_concurrent: usize,
-        /// Default connections per download (1-64).
+        /// Default maximum connections per download (1-64); each download
+        /// adds connections only while they raise its throughput.
         #[arg(short = 'x', long, default_value_t = 16, value_parser = conns_range)]
         connections: usize,
         #[arg(short = 'k', long, default_value = "1M", value_parser = parse_size)]

@@ -66,13 +66,23 @@ async fn counting_origin(size: u64) -> (String, Arc<[AtomicU64; 2]>) {
                     )
                 })
                 .unwrap_or((0, size));
-            let mut body = vec![0u8; (b - a) as usize];
-            fill(&mut body, a);
+            // About 4 MiB/s per connection, so several connections pay off.
+            let body = futures_util::stream::unfold(a, move |pos| async move {
+                if pos >= b {
+                    return None;
+                }
+                let n = (b - pos).min(64 << 10);
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                let mut buf = vec![0u8; n as usize];
+                fill(&mut buf, pos);
+                Some((Ok::<_, std::io::Error>(bytes::Bytes::from(buf)), pos + n))
+            });
             axum::response::Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::ETAG, "\"e\"")
                 .header(header::CONTENT_RANGE, format!("bytes {a}-{}/{size}", b - 1))
-                .body(axum::body::Body::from(body))
+                .header(header::CONTENT_LENGTH, b - a)
+                .body(axum::body::Body::from_stream(body))
                 .unwrap()
         }
     });
@@ -272,6 +282,8 @@ async fn changed_file_fails_without_mixing() {
     let cfg = Config {
         size: 8 << 20,
         change_etag_after: Some(1),
+        // Slow per connection so that more requests follow the first one.
+        rate_per_conn: Some(2 << 20),
         ..Config::default()
     };
     let srv = spawn_local(cfg).await.unwrap();
@@ -402,4 +414,65 @@ async fn unlabelled_whole_file_of_another_length_is_not_spliced_in() {
     let r = download(o, None, CancellationToken::new()).await;
     assert!(r.is_err(), "spliced file reported complete: {r:?}");
     assert!(!out.exists());
+}
+
+/// A pause followed at once by a resume (the daemon does exactly this) must
+/// not find the partial file still locked by the stopped download's tasks.
+/// On one thread an aborted task lingers until the caller yields, so a
+/// download that returns before its tasks are gone is caught every time.
+#[tokio::test(flavor = "current_thread")]
+async fn restart_right_after_cancel_finds_the_file_free() {
+    let cfg = Config {
+        size: 8 << 20,
+        rate_per_conn: Some(1 << 20),
+        ..Config::default()
+    };
+    let srv = spawn_local(cfg.clone()).await.unwrap();
+    let out = tmpdir("quickresume").join("f.bin");
+    for round in 0..50 {
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            c.cancel();
+        });
+        let r = download(opts(srv.url(), &out), None, cancel).await;
+        // The moment it returns, nothing of it may hold the file.
+        if let Ok(f) = std::fs::File::open(part_path(&out)) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: valid fd for the lifetime of `f`.
+            let locked = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(
+                locked, 0,
+                "round {round}: partial file still locked after return"
+            );
+        }
+        if let Err(e) = r {
+            let e = format!("{e:#}");
+            assert!(!e.contains("another process"), "round {round}: {e}");
+        }
+        if out.exists() {
+            break;
+        }
+    }
+}
+
+/// Retries of the first request must not count as connection setup time:
+/// that would make every new connection look too slow to be worth it.
+#[tokio::test]
+async fn retried_first_request_still_goes_parallel() {
+    let cfg = Config {
+        size: 24 << 20,
+        rate_per_conn: Some(2 << 20),
+        fail_requests: vec![1, 2, 3, 4],
+        ..Config::default()
+    };
+    let srv = spawn_local(cfg.clone()).await.unwrap();
+    let out = tmpdir("retried-parallel").join("f.bin");
+    download(opts(srv.url(), &out), None, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_file(&out, cfg.size);
+    let active = srv.stats.max_active.load(Ordering::SeqCst);
+    assert!(active > 4, "stayed at {active} connection(s)");
 }

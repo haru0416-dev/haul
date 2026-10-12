@@ -32,8 +32,10 @@ fn assert_file(path: &Path, size: u64) {
 
 #[tokio::test]
 async fn segmented_download_is_exact() {
+    // Limited per connection, so more connections pay off and get used.
     let cfg = Config {
         size: (8 << 20) + 12345,
+        rate_per_conn: Some(2 << 20),
         ..Config::default()
     };
     let srv = spawn_local(cfg.clone()).await.unwrap();
@@ -116,9 +118,11 @@ async fn adapts_to_connection_limit() {
 
 #[tokio::test]
 async fn changed_remote_file_is_an_error() {
+    // Slow per connection so that more requests follow the first one.
     let cfg = Config {
         size: 8 << 20,
         change_etag_after: Some(1),
+        rate_per_conn: Some(2 << 20),
         ..Config::default()
     };
     let srv = spawn_local(cfg).await.unwrap();

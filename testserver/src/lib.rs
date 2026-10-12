@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use bytes::Bytes;
@@ -52,6 +53,22 @@ pub struct Config {
     pub ignore_if_range: bool,
     /// Honour Range on the first request only; answer later ones with 200.
     pub range_first_only: bool,
+    /// Per-TCP-connection speeds, like network paths that differ: the k-th
+    /// connection to make a request streams at `conn_rates[k % len]` bytes
+    /// per second (overrides `rate_per_conn`).
+    pub conn_rates: Vec<u64>,
+    /// Delay before every response's headers (round trip plus server time).
+    pub latency: Duration,
+    /// Simulated TCP/TLS path with this round trip time (zero: off). A new
+    /// connection waits two extra round trips (handshakes) before its first
+    /// response, and its speed starts at ten segments per round trip,
+    /// doubling every round trip (slow start) up to its per-connection
+    /// rate; after an idle second the ramp starts over, as Linux does with
+    /// tcp_slow_start_after_idle.
+    pub rtt: Duration,
+    /// Bottleneck shared by all responses, bytes per second (the client's
+    /// link). Each chunk takes its turn on it.
+    pub link: Option<u64>,
 }
 
 impl Default for Config {
@@ -73,6 +90,10 @@ impl Default for Config {
             mirror_requests: Vec::new(),
             ignore_if_range: false,
             range_first_only: false,
+            conn_rates: Vec::new(),
+            latency: Duration::ZERO,
+            rtt: Duration::ZERO,
+            link: None,
         }
     }
 }
@@ -95,6 +116,35 @@ struct State {
     stats: Arc<Stats>,
     /// Remaining uses per signed URL id.
     signed: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
+    /// Client connections in the order they first made a request.
+    conns: std::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<Conn>>>,
+    /// When the shared link is next free.
+    link_free: tokio::sync::Mutex<Instant>,
+}
+
+struct Conn {
+    index: usize,
+    /// (start of the current slow-start ramp, end of the last send)
+    ramp: std::sync::Mutex<(Instant, Instant)>,
+    fresh: std::sync::atomic::AtomicBool,
+}
+
+impl State {
+    fn conn(&self, peer: SocketAddr) -> Arc<Conn> {
+        let mut conns = self.conns.lock().unwrap();
+        let next = conns.len();
+        conns
+            .entry(peer)
+            .or_insert_with(|| {
+                let now = Instant::now();
+                Arc::new(Conn {
+                    index: next,
+                    ramp: std::sync::Mutex::new((now, now)),
+                    fresh: std::sync::atomic::AtomicBool::new(true),
+                })
+            })
+            .clone()
+    }
 }
 
 /// Byte of the served file at `offset`.
@@ -145,13 +195,34 @@ pub async fn spawn(config: Config, addr: SocketAddr) -> anyhow::Result<Server> {
         config,
         stats: stats.clone(),
         signed: Default::default(),
+        conns: Default::default(),
+        link_free: tokio::sync::Mutex::new(Instant::now()),
     });
-    let app = Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
-        let state = state.clone();
-        async move { handle(&state, method, &uri, &headers) }
-    });
+    let app = Router::new().fallback(
+        move |ConnectInfo(peer): ConnectInfo<SocketAddr>,
+              method: Method,
+              uri: Uri,
+              headers: HeaderMap| {
+            let state = state.clone();
+            async move {
+                let conn = state.conn(peer);
+                let mut wait = state.config.latency;
+                if conn.fresh.swap(false, Ordering::SeqCst) {
+                    wait += 2 * state.config.rtt;
+                }
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                handle(&state, &conn, method, &uri, &headers)
+            }
+        },
+    );
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     Ok(Server { addr, stats })
 }
@@ -161,7 +232,13 @@ pub async fn spawn_local(config: Config) -> anyhow::Result<Server> {
     spawn(config, "127.0.0.1:0".parse().unwrap()).await
 }
 
-fn handle(state: &State, method: Method, uri: &Uri, headers: &HeaderMap) -> Response {
+fn handle(
+    state: &Arc<State>,
+    conn: &Arc<Conn>,
+    method: Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response {
     let cfg = &state.config;
     let stats = &state.stats;
     let n = stats.requests.fetch_add(1, Ordering::SeqCst) + 1;
@@ -269,6 +346,8 @@ fn handle(state: &State, method: Method, uri: &Uri, headers: &HeaderMap) -> Resp
     let served = stats.served.fetch_add(1, Ordering::SeqCst) + 1;
     let rate = if cfg.slow_requests.contains(&served) {
         Some(cfg.slow_rate)
+    } else if !cfg.conn_rates.is_empty() {
+        Some(cfg.conn_rates[conn.index % cfg.conn_rates.len()])
     } else {
         cfg.rate_per_conn
     };
@@ -287,6 +366,9 @@ fn handle(state: &State, method: Method, uri: &Uri, headers: &HeaderMap) -> Resp
         chunk: cfg.chunk,
         stats: state.stats.clone(),
         _guard: guard,
+        next: Instant::now(),
+        state: state.clone(),
+        conn: conn.clone(),
     };
     let s = stream::unfold(body, |mut b| async move {
         if b.pos >= b.end {
@@ -296,9 +378,47 @@ fn handle(state: &State, method: Method, uri: &Uri, headers: &HeaderMap) -> Resp
             return Some((Err(std::io::Error::other("dropped")), b));
         }
         let len = (b.end - b.pos).min(b.chunk as u64) as usize;
-        if let Some(rate) = b.rate {
+        let rtt = b.state.config.rtt;
+        if !rtt.is_zero() {
+            // Slow start: ten 1460-byte segments per round trip, doubling.
+            let now = Instant::now();
+            let ramp = {
+                let mut r = b.conn.ramp.lock().unwrap();
+                if now.duration_since(r.1) > Duration::from_secs(1) {
+                    r.0 = now;
+                }
+                r.1 = now;
+                now.duration_since(r.0)
+            };
+            let doublings = (ramp.as_secs_f64() / rtt.as_secs_f64()).min(40.0);
+            let mut rate = 14600.0 / rtt.as_secs_f64() * doublings.exp2();
+            if let Some(cap) = b.rate {
+                rate = rate.min(cap as f64);
+            }
+            // Catch up after oversleeping (timers tick in milliseconds),
+            // but do not bank time spent idle.
+            if b.next + Duration::from_millis(50) < now {
+                b.next = now;
+            }
+            b.next += Duration::from_secs_f64(len as f64 / rate);
+            // Sub-millisecond sleeps would round up to a whole tick.
+            if b.next > now + Duration::from_millis(1) {
+                tokio::time::sleep_until(b.next).await;
+            }
+        } else if let Some(rate) = b.rate {
             let due = b.began + Duration::from_secs_f64((b.sent + len as u64) as f64 / rate as f64);
             tokio::time::sleep_until(due).await;
+        }
+        if let Some(link) = b.state.config.link {
+            let at = {
+                let mut free = b.state.link_free.lock().await;
+                *free =
+                    (*free).max(Instant::now()) + Duration::from_secs_f64(len as f64 / link as f64);
+                *free
+            };
+            if at > Instant::now() + Duration::from_millis(1) {
+                tokio::time::sleep_until(at).await;
+            }
         }
         let mut buf = vec![0u8; len];
         fill(&mut buf, b.pos);
@@ -320,6 +440,9 @@ struct BodyState {
     chunk: usize,
     stats: Arc<Stats>,
     _guard: ActiveGuard,
+    next: Instant,
+    state: Arc<State>,
+    conn: Arc<Conn>,
 }
 
 struct ActiveGuard(Arc<Stats>);
